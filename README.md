@@ -21,7 +21,7 @@ cd clonecensorweighting
 
 ### 2. Use `rig` to install R 4.4.2
 
-This project is pinned to R `4.4.2` for reproducibility..
+This project is pinned to R `4.4.2` for reproducibility.
 
 ```sh
 rig add 4.4.2
