@@ -1,0 +1,218 @@
+---
+title: "Getting started with clonecensorweighting"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Getting started with clonecensorweighting}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+```{r setup}
+library(clonecensorweighting)
+```
+
+## Why clone-censor-weighting?
+
+Suppose we want to know whether surgery improves survival in lung cancer
+patients. Comparing patients who had surgery against those who did not, using a
+naive analysis, can be badly biased. One reason is *immortal time bias*: to
+appear in the "surgery" group, a patient has to survive long enough to actually
+receive surgery. That guaranteed survival time gets unfairly credited to the
+surgery group.
+
+Clone-censor-weighting (CCW) is a technique used in target trial emulation to
+address this. The idea has three parts, which also give the method its name:
+
+- **Clone**: each patient is copied into every treatment strategy under
+  comparison, so that at the start of follow-up everyone is compatible with
+  every strategy.
+- **Censor**: a clone is censored at the moment the patient's observed data
+  stops being consistent with the strategy that clone was assigned to.
+- **Weight**: inverse-probability-of-censoring weights correct for the
+  artificial censoring introduced in the previous step.
+
+This vignette walks through the pipeline end to end, using a lung cancer
+dataset that ships with the package.
+
+## The example data
+
+The package includes `lungcancer`, a dataset of 200 lung cancer patients.
+
+```{r}
+data(lungcancer)
+head(lungcancer)
+```
+
+The columns we rely on are:
+
+- `id`: patient identifier
+- `surgery`: whether the patient received surgery (`1`) or not (`0`)
+- `timetosurgery`: time from baseline to surgery (`NA` if never operated on)
+- `death`: whether the patient died (`1`) or not (`0`) — the outcome event
+- `fup_obs`: observed follow-up time
+
+The remaining columns (`sex`, `charlson`, `perf`, `stage`, `emergency`, `age`,
+`deprivation`) describe patient characteristics that can be used as covariates
+when estimating censoring weights.
+
+We compare two strategies, and give them names we will reuse throughout:
+
+```{r}
+arms <- c("Control", "Surgery")
+```
+
+The **grace period** is central to this analysis. It is the window during which
+a patient is still considered compatible with the "surgery" strategy. A patient
+who has surgery within the grace period is consistent with the treated strategy;
+one who does not is consistent with the control strategy. Here we use a grace
+period of 90 days.
+
+```{r}
+grace_period <- 90
+```
+
+## Step 1: Clone the data across arms
+
+`clone_arms()` copies the full dataset once per strategy and returns a list with
+one data frame per arm.
+
+```{r}
+clones <- clone_arms(lungcancer, arms)
+
+names(clones)
+```
+
+At this point the two data frames are identical copies of the original data. The
+strategy-specific logic is applied in the next steps.
+
+## Step 2: Build the policy and censoring logic
+
+Two helper functions describe how each arm's emulated outcome, follow-up, and
+censoring should be derived. They do not touch the data yet; they return the
+rules (as expressions) that will be applied in Step 3.
+
+`create_policy_A()` produces the emulated outcome and follow-up under the grace
+period policy.
+
+```{r}
+policy <- create_policy_A(
+  arms              = arms,
+  treatment         = "surgery",
+  time_to_treatment = "timetosurgery",
+  grace_period      = grace_period,
+  outcome           = "death",
+  followup          = "fup_obs"
+)
+```
+
+`create_censoring_logics_A()` produces the censoring indicator and the time at
+which that indicator can first be determined.
+
+```{r}
+censoring <- create_censoring_logics_A(
+  arms              = arms,
+  treatment         = "surgery",
+  time_to_treatment = "timetosurgery",
+  grace_period      = grace_period,
+  followup          = "fup_obs"
+)
+```
+
+Each of these returns a nested list, one entry per arm. The policy rules create
+the variables `.outcome` and `.fup`; the censoring rules create `.censoring` and
+`.fup_uncensored`.
+
+## Step 3: Apply the logic to the clones
+
+`apply_logics()` evaluates the rules against each arm's data. We combine the
+policy and censoring rules for each arm into a single set of new variables.
+
+```{r}
+logics <- list(
+  Control = c(policy$Control, censoring$Control),
+  Surgery = c(policy$Surgery, censoring$Surgery)
+)
+
+emulated <- apply_logics(clones, logics)
+
+lapply(emulated, names)
+```
+
+Each arm's data frame now carries the emulated variables (`.outcome`, `.fup`,
+`.censoring`, `.fup_uncensored`) alongside the original columns.
+
+## Step 4: Assemble the final long-form data
+
+`create_final_data()` turns each patient into a sequence of time intervals
+(a counting-process, or "long", format). Internally it finds every event time,
+splits each patient's follow-up at those times, and combines the outcome and
+censoring information into one table per arm.
+
+```{r}
+final <- create_final_data(
+  clones          = emulated,
+  clone_followup  = ".fup",
+  clone_outcome   = ".outcome",
+  clone_censoring = ".censoring",
+  col_ids         = "id"
+)
+
+head(final$Surgery)
+```
+
+Each row is now one patient-interval, bounded by `Tstart` and `Tstop`. Because a
+single patient contributes several intervals, each arm has many more rows than
+the original 200 patients:
+
+```{r}
+lapply(final, dim)
+```
+
+This long-form data is the input for the final steps of a CCW analysis:
+estimating inverse-probability-of-censoring weights over time and fitting a
+weighted survival model to compare the two strategies.
+
+## Reading your own data
+
+The example above uses the bundled `lungcancer` data. To run the same workflow
+on your own data, it needs, at a minimum:
+
+- an **identifier** column for each patient
+- a binary **treatment** column, coded `0` / `1`
+- a **time-to-treatment** column (numeric, `NA` for the untreated)
+- a binary **outcome** column, coded `0` / `1`
+- a numeric **follow-up time** column
+
+The column *names* are up to you; you pass them to the arguments of the policy
+and censoring helpers, as we did above. Any additional columns are carried along
+and can serve as covariates.
+
+`read_trial_data()` is a small convenience wrapper for reading such data from a
+CSV file into a tibble. It does not impose any particular column structure; it
+simply reads the file:
+
+```{r, eval = FALSE}
+my_data <- read_trial_data("path/to/your-data.csv")
+```
+
+## Summary
+
+In this vignette we:
+
+- motivated clone-censor-weighting with a lung cancer surgery question and the
+  problem of immortal time bias,
+- cloned the data across a control and a surgery arm with `clone_arms()`,
+- described the grace-period policy and censoring rules with `create_policy_A()`
+  and `create_censoring_logics_A()`,
+- applied those rules with `apply_logics()`,
+- and assembled a long-form analysis dataset with `create_final_data()`.
+
+The remaining steps of a full CCW analysis — estimating censoring weights and
+fitting a weighted outcome model — build directly on this long-form dataset.
