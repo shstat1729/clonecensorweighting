@@ -9,3 +9,5 @@
 ^data-raw$
 
 ^example_data/
+^.*\.Rproj$
+^\.Rproj\.user$

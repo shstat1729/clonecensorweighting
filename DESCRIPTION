@@ -28,3 +28,4 @@ Config/testthat/edition: 3
 Roxygen: list(markdown = TRUE)
 RoxygenNote: 8.0.0
 LazyData: true
+VignetteBuilder: knitr
